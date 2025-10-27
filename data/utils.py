@@ -7,7 +7,7 @@ def observation_time(
         data: np.ndarray,
         sample_rate: Union[float, int],
         integration_time: Union[float, int]
-    ) -> float:
+) -> float:
     """
     Calculate the total observation time in seconds.
     
