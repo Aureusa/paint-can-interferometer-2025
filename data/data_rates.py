@@ -74,6 +74,38 @@ class DataUnit:
         """
         return f"{self.value:.2f} {self.unit}"
     
+    def __add__(self, other: 'DataUnit') -> 'DataUnit':
+        """
+        Add two DataUnit instances after converting to the same unit.
+
+        :other: another DataUnit instance to add
+        :type other: DataUnit
+        :return: new DataUnit instance representing the sum
+        :rtype: DataUnit
+        """
+        if not isinstance(other, DataUnit):
+            raise ValueError("Can only add with another DataUnit instance.")
+        
+        other_converted = other.to(self.unit)
+        total_value = self.value + other_converted.value
+        return DataUnit(total_value, self.unit)
+    
+    def __sub__(self, other: 'DataUnit') -> 'DataUnit':
+        """
+        Subtract two DataUnit instances after converting to the same unit.
+
+        :other: another DataUnit instance to subtract
+        :type other: DataUnit
+        :return: new DataUnit instance representing the difference
+        :rtype: DataUnit
+        """
+        if not isinstance(other, DataUnit):
+            raise ValueError("Can only subtract another DataUnit instance.")
+        
+        other_converted = other.to(self.unit)
+        result_value = self.value - other_converted.value
+        return DataUnit(result_value, self.unit)
+    
     def integrate_over_time(self, time_seconds: float) -> 'DataUnit':
         """
         Integrate the data rate over a given time in seconds to get total data volume.
@@ -244,20 +276,42 @@ def data_rate(
     return data_rate_bytes.to(unit)
 
 def total_data_volume(
-    data_rate: DataUnit,
     observation_time: float,
+    bytes_per_c_sample: Union[float, int],
+    number_of_channels: int,
+    number_of_antennas: int,
+    integration_time: Union[float, int] = 1,
     unit: str = "bytes"
 ) -> DataUnit:
     """
-    Calculate the total data volume.
+    Calculate the total data volume on the disk over the observation time.
+    This is first done by calculating the total numbe of integrated samples
+    over the observation time and then calculating the data rate for that
+    number of samples per second. Finally, we integrate the data rate over
+    the observation time to get the total data volume.
 
-    :data_rate: data rate in bytes per second
-    :type data_rate: float
-    :observation_time: observation time in seconds
+    :observation_time: total observation time in seconds
     :type observation_time: float
-    :unit: unit of the returned data volume (bytes, kb, mb, gb)
+    :bytes_per_c_sample: bytes per complex sample
+    :type bytes_per_c_sample: float or int
+    :number_of_channels: number of channels
+    :type number_of_channels: int
+    :number_of_antennas: number of antennas
+    :type number_of_antennas: int
+    :integration_time: integration time in seconds
+    :type integration_time: float or int
+    :unit: unit of the returned total data volume (bytes, kb, mb, gb
     :type unit: str
     :return: total data volume in the specified unit
-    :rtype: float
+    :rtype: DataUnit
     """
-    return data_rate.integrate_over_time(observation_time).to(unit)
+    integrated_samples = observation_time // integration_time
+
+    total_data_rate = data_rate(
+        samples_per_second=integrated_samples,
+        bytes_per_c_sample=bytes_per_c_sample,
+        number_of_channels=number_of_channels,
+        number_of_antennas=number_of_antennas,
+        unit=DataUnit.BYTES_PER_SECOND
+    )
+    return total_data_rate.integrate_over_time(integrated_samples).to(unit)
