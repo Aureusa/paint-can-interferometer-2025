@@ -8,3 +8,6 @@ __pycache__/
 
 # VS code
 .vscode/
+
+# mock_data folder used for testing
+mock_data/
