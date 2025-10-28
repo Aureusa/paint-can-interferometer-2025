@@ -1,0 +1,31 @@
+################################################
+# Observation configuration for AirSpy devices #
+################################################
+
+# Sampling rate for the observation
+sampling_rate: 10e6  # in Hz
+
+# Center frequency for the observation
+center_frequency: 1.42e9  # in Hz
+
+# FFT size for the auto-correlation
+fft_size: 1024  # Number of points in FFT
+
+# Integration time for each observation
+integration_time: 1  # in seconds
+
+# Observation duration
+observation_duration: 5  # in seconds
+
+# List of AirSpy devices
+device_list: [ 
+  "1",
+  "2",
+  "3",
+  "4",
+  "5",
+  "6",
+  "7",
+  "8",
+  "9",
+]

@@ -5,17 +5,17 @@ It assumes that data files are stored in a directory specified by the DATA_FOLDE
 The way the data is organized within this folder is as follows:
     - Each observation session has its own subfolder named with a timestamp session_yyyymmdd_hhmmss (e.g., session_20231015_153000).
     - Within each session folder, data files are named according to the following convention:
-    antenna_<antenna_number>_channels_<number_of_channels>_date_<YYYYMMDD>_time_<HHMMSS>.npy
-    - Data files are stored in NumPy binary format (.npy) for efficient loading.
+    antenna_<antenna_number>_date_<YYYYMMDD>_time_<HHMMSS>
+    - Data files are stored in raw binary format.
 
     Schematically:
     DATA_FOLDER/
         session_20231015_153000/
-            antenna_1_channels_2_date_20231015_time_153000.npy
-            antenna_2_channels_2_date_20231015_time_153000.npy
+            antenna_1_date_20231015_time_153000
+            antenna_2_date_20231015_time_153000
         session_20231016_101500/
-            antenna_1_channels_4_date_20231016_time_101500.npy
-            antenna_2_channels_4_date_20231016_time_101500.npy
+            antenna_1_date_20231016_time_101500
+            antenna_2_date_20231016_time_101500
 
 The DataReader class provides methods to:
     - Load data from a specified session folder.
@@ -71,7 +71,7 @@ class DataReader:
 
         data = {}
         for antenna_num in range(1, self.num_antennas + 1):
-            file_pattern = f"antenna_{antenna_num}_*.npy"
+            file_pattern = f"antenna_{antenna_num}_*"
             files = list(session_path.glob(file_pattern))
             if not files:
                 warnings.warn(
@@ -86,7 +86,12 @@ class DataReader:
                     UserWarning
                 )
 
-            data_array = np.load(files[0])
+            # Assume data is stored in raw binary format as float32
+            warnings.warn(
+                f"Assuming data file {files[0]} is in raw binary format with float32 data type.",
+                UserWarning
+            )
+            data_array = np.fromfile(files[0], dtype=np.float32)
             data[antenna_num] = data_array
 
         return data
@@ -124,11 +129,11 @@ class DataReader:
         for f in self.base_data_folder.iterdir():
             if f.is_dir():
                 if f.name.startswith("session_") and len(f.name) == 23:  # e.g., session_20231015_153000
-                    files = list(f.glob("*.npy")) # Get all the files in the subfolder that end with .npy
+                    files = list(f.glob("*")) # Get all the files in the subfolder
 
-                    if not files: # No .npy files found
+                    if not files: # No files found
                         warnings.warn(
-                            f"Session folder {f} does not contain any .npy files. "
+                            f"Session folder {f} does not contain any files. "
                             f"Skipping.",
                             UserWarning
                         )
