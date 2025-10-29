@@ -22,8 +22,19 @@ from argparse import ArgumentParser
 from gnuradio.eng_arg import eng_float, intx
 from gnuradio import eng_notation
 import osmosdr
-import time
+from datetime import datetime, timezone
+import os
 import yaml
+import json
+import threading
+import multiprocessing
+import time
+import os
+from multiprocessing.pool import Pool
+
+from data.obs_md import SharedMetadataManager
+from utils import print_box
+
 
 # Read configuration from YAML file
 with open("observation_conf.yaml", 'r') as file:
@@ -36,34 +47,6 @@ FFT_SIZE = config.get("fft_size", 1024)
 
 DEVICE_LIST = config.get("device_list", ["1", "2", "3", "4", "5", "6", "7", "8", "9"])
 OBSERVATION_DURATION = config.get("observation_duration", 3600)
-
-
-def print_box(message: str):
-    """
-    Print a message in a box format.
-    The box is created using Unicode box-drawing characters.
-
-    :param message: The message to be printed in the box.
-    :type message: str
-    """
-    # Ensure the box starts on a new line
-    print()
-
-    #91
-    lines = message.split('\n')
-    for line in lines:
-        if len(line) > 91:
-            split_index = line.rfind(' ', 0, 91)
-            if split_index != -1:
-                lines.insert(lines.index(line) + 1, line[split_index + 1:])
-                lines[lines.index(line)] = line[:split_index]
-    max_length = 88
-    border_up = '┌' + '─' * (max_length + 2) + '┐'
-    border_down = '└' + '─' * (max_length + 2) + '┘'
-    print(border_up)
-    for line in lines:
-        print(f'│ {line.ljust(max_length)} │')
-    print(border_down)
 
 
 def print_config(session_folder_name: str = ""):
@@ -217,21 +200,56 @@ class AntennaGNU(gr.top_block, Qt.QWidget):
         self.fft_size = fft_size
 
 
-
-
-def main(top_block_cls=AntennaGNU, device: str = "example_device", filename: str = "output"):
+def main(top_block_cls=AntennaGNU, device: str = "example_device", filename: str = "output", metadata_manager=None):
+    # Record start time with high precision
+    start_time = datetime.now(timezone.utc)
+    start_timestamp = start_time.timestamp()
+    
+    # Update process metadata with start time
+    if metadata_manager:
+        metadata_manager.update_process(
+            device,
+            filename=filename,
+            start_time_utc=start_time.isoformat(),
+            start_timestamp=start_timestamp,
+            status="started",
+            process_id=os.getpid()
+        )
 
     qapp = Qt.QApplication(sys.argv)
-
     tb = top_block_cls(device=device, filename=filename)
 
-    tb.start()
+    def finalize_metadata(reason="completed"):
+        end_time = datetime.now(timezone.utc)
+        end_timestamp = end_time.timestamp()
+        duration = end_timestamp - start_timestamp
+        
+        process_data = {
+            "end_time_utc": end_time.isoformat(),
+            "end_timestamp": end_timestamp,
+            "duration_seconds": duration,
+            "status": reason
+        }
+        
+        # Check final file size if it exists
+        if os.path.exists(filename):
+            file_size = os.path.getsize(filename)
+            process_data["file_size_bytes"] = file_size
+            process_data["total_samples"] = file_size // 4
+        
+        # Update metadata
+        if metadata_manager:
+            metadata_manager.update_process(device, **process_data)
+        
+        print_box(f"Process for device {device} ended ({reason}): {duration:.3f}s duration")
 
+    tb.start()
     tb.show()
 
     def sig_handler(sig=None, frame=None):
         tb.stop()
         tb.wait()
+        finalize_metadata("interupted")
         print_box(f"Process for device {device} ended.")
         Qt.QApplication.quit()
 
@@ -243,8 +261,13 @@ def main(top_block_cls=AntennaGNU, device: str = "example_device", filename: str
     # Add observation timer
     observation_timer = Qt.QTimer()
     observation_timer.setSingleShot(True)
-    observation_timer.timeout.connect(lambda: (tb.stop(), tb.wait(), Qt.QApplication.quit()))
-    observation_timer.start(OBSERVATION_DURATION * 1000)  # Convert seconds to milliseconds
+    observation_timer.timeout.connect(lambda: (
+        tb.stop(), 
+        tb.wait(), 
+        finalize_metadata("observation_complete"),
+        Qt.QApplication.quit()
+    ))
+    observation_timer.start(OBSERVATION_DURATION * 1000)
 
     timer = Qt.QTimer()
     timer.start(500)
@@ -253,10 +276,6 @@ def main(top_block_cls=AntennaGNU, device: str = "example_device", filename: str
     qapp.exec_()
 
 def multithreaded_main():
-    import multiprocessing
-    import time
-    import os
-    from multiprocessing.pool import Pool
     multiprocessing.set_start_method('spawn')
 
     current_date = time.strftime("%Y%m%d")
@@ -267,32 +286,49 @@ def multithreaded_main():
 
     # Create session folder
     os.makedirs(session_folder_name, exist_ok=True)
+    
 
-    # Create a shared event for synchronized stopping - this might not be needed with head block
-    # TODO: ASK IN CLASS - MIGHT NEED TO REMOVE
-    stop_event = multiprocessing.Event()
+    with multiprocessing.Manager() as manager:
+        metadata_manager = SharedMetadataManager(
+            manager,
+            sampling_rate=SAMPLING_RATE,
+            integration_time=INTEGRATION_TIME,
+            frequency=FREQUENCY,
+            fft_size=FFT_SIZE,
+            observation_duration=OBSERVATION_DURATION
+        )
+        metadata_manager.initialize_session(session_folder_name, DEVICE_LIST)
 
-    with Pool(processes=len(DEVICE_LIST)) as pool:
-        # Generate unique filenames for each device
-        args = [(AntennaGNU, device, os.path.join(session_folder_name, f"antenna_{i+1}_date_{current_date}_time_{current_time}")) for i, device in enumerate(DEVICE_LIST)]
+        with Pool(processes=len(DEVICE_LIST)) as pool:
+            # Generate unique filenames for each device
+            args = [(AntennaGNU, device, os.path.join(session_folder_name, f"antenna_{i+1}_date_{current_date}_time_{current_time}"), metadata_manager) for i, device in enumerate(DEVICE_LIST)]
+            
+            # TODO: ASK IN CLASS
+            # I am not sure if we should use starmap or starmap_async here.
+            # Also not sure how to properly integrate stop_event into main
+            # function and even if I should have it in the first place.
+            # pool.starmap(main, args)
+
+            # Start all processes
+            result = pool.starmap_async(main, args)
+            
+            # Wait for all processes to complete
+            result.wait()
+
+        # Finalize session metadata
+        metadata_manager.finalize_session()
         
-        # TODO: ASK IN CLASS
-        # I am not sure if we should use starmap or starmap_async here.
-        # Also not sure how to properly integrate stop_event into main
-        # function and even if I should have it in the first place.
-        # pool.starmap(main, args)
-
-        # Start all processes
-        result = pool.starmap_async(main, args)
+        # Get completion stats
+        completed, total = metadata_manager.get_completed_count()
         
-        # Wait for observation duration, then signal all to stop
-        time.sleep(OBSERVATION_DURATION)
-        stop_event.set()
+        print_box("All processes completed successfully.")
         
-        # Wait for all processes to complete
-        result.wait()
+        # Print final metadata summary
+        session_duration = metadata_manager.shared_dict.get("duration_seconds", 0)
+        info = f"Session duration: {session_duration:.2f} seconds"
+        info += f"Processes completed: {completed}/{total}"
+        print_box(info)
 
-    print_box("All processes completed successfully.")
 
 if __name__ == '__main__':
     multithreaded_main()

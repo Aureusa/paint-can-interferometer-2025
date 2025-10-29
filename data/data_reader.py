@@ -22,11 +22,18 @@ The DataReader class provides methods to:
     - List all available session folders in the DATA_FOLDER.
 '''
 import os
+from typing import Union
 import numpy as np
 from pathlib import Path
+from logging import log
 
 from dotenv import load_dotenv
 import warnings
+
+from .obs_md import ObservationMetadata
+from .utils import reshape_fft_data
+
+from utils import print_box
 
 class DataReader:
     """
@@ -52,7 +59,7 @@ class DataReader:
 
         self.session_folders = self._get_session_folders()
 
-    def get_data(self, session_folder: str) -> dict[int, np.ndarray]:
+    def get_data(self, session_folder: str, fft_size: Union[None, int] = None) -> dict[int, np.ndarray]:
         """
         Read data files from a specified session folder.
 
@@ -94,7 +101,48 @@ class DataReader:
             data_array = np.fromfile(files[0], dtype=np.float32)
             data[antenna_num] = data_array
 
+            # Reshape data if fft_size is provided or can be obtained from metadata
+            if fft_size is not None:
+                data[antenna_num] = reshape_fft_data(data_array, fft_size=fft_size)
+                print_box(f"Reshaped data for antenna {antenna_num} using the provided fft_size argument into segments of size {fft_size}.")
+            else:
+                try:
+                    metadata = self.get_metadata(session_folder)
+                    fft_size = metadata.fft_size
+
+                    data[antenna_num] = reshape_fft_data(data_array, fft_size=fft_size)
+                    print_box(f"Reshaped data for antenna {antenna_num} using fft_size from metadata into segments of size {fft_size}.")
+                except:
+                    info = f"Failed to reshape data for antenna {antenna_num} using fft_size from metadata."
+                    info += "\nSince no fft_size argument was provided, returning raw data array."
+                    print_box(info)
+
         return data
+    
+    def get_metadata(self, session_folder: str) -> ObservationMetadata:
+        """
+        Read metadata from a specified session folder.
+
+        :param session_folder: Name of the session folder to read metadata from.
+        Must be one of the folders listed by the `list_sessions` method.
+        :type session_folder: str
+        :return: Dictionary containing metadata information.
+        :rtype: dict
+        """
+        session_path = self.base_data_folder / session_folder
+        metadata_file = session_path / "observation_metadata.json"
+        if not metadata_file.exists():
+            raise FileNotFoundError(
+                f"Metadata file {metadata_file} does not exist in session {session_folder}."
+            )
+        
+        import json
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+
+        metadata = ObservationMetadata.from_dict(metadata)
+        
+        return metadata
 
     def list_sessions(self) -> list[str]:
         """
