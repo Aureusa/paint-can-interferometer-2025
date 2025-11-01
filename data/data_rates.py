@@ -278,6 +278,7 @@ def data_rate(
 def total_data_volume(
     observation_time: float,
     bytes_per_c_sample: Union[float, int],
+    fft_size: int,
     number_of_channels: int,
     number_of_antennas: int,
     integration_time: Union[float, int] = 1,
@@ -308,7 +309,7 @@ def total_data_volume(
     integrated_samples = observation_time // integration_time
 
     total_data_rate = data_rate(
-        samples_per_second=integrated_samples,
+        samples_per_second=integrated_samples * fft_size,
         bytes_per_c_sample=bytes_per_c_sample,
         number_of_channels=number_of_channels,
         number_of_antennas=number_of_antennas,
