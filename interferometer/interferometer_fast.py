@@ -36,9 +36,6 @@ import threading
 
 from utils import print_box
 
-# Global verbose control - set to False to reduce output
-VERBOSE = True
-
 
 class VisibilityCorrelator(gr.sync_block):
     """
@@ -60,19 +57,35 @@ class VisibilityCorrelator(gr.sync_block):
             out_sig=out_sig,
         )
         
+        # Store parameters
         self.fft_size = fft_size
         self.num_antennas = num_antennas
-        self.integration_samples = integration_samples  # Add integration capability
+        self.integration_samples = integration_samples
+
+        # Device setup (GPU/CPU) - Always check for CUDA availability
         self.use_gpu = use_gpu and torch.cuda.is_available()
         self.device = torch.device('cuda' if self.use_gpu else 'cpu')
         
-        # Pre-compute indices for extracting upper triangle
+        # Pre-compute indices for extracting upper triangle - N(N+1)/2 baselines
         self.baseline_indices = []
+        baseline_i_indices = []
+        baseline_j_indices = []
+        
         for i in range(num_antennas):
             for j in range(i, num_antennas):
                 self.baseline_indices.append((i, j))
-        
-        # Integration buffers
+                baseline_i_indices.append(i)
+                baseline_j_indices.append(j)
+
+        # Store as tensors/arrays for vectorized access
+        if self.use_gpu:
+            self.baseline_i_indices = torch.tensor(baseline_i_indices, device=self.device)
+            self.baseline_j_indices = torch.tensor(baseline_j_indices, device=self.device)
+        else:
+            self.baseline_i_indices = np.array(baseline_i_indices)
+            self.baseline_j_indices = np.array(baseline_j_indices)
+
+        # Initialize buffers
         self.reset_integration_buffers()
         
         # Add monitoring variables
@@ -80,13 +93,11 @@ class VisibilityCorrelator(gr.sync_block):
         self.output_count = 0
         self.start_time = None
         self.last_report_time = 0
-        self.samples_per_antenna = [0] * num_antennas
-        self.data_fingerprints = [[] for _ in range(num_antennas)]
-        self.first_data_time = [None] * num_antennas
 
         self._print_correlator_info()
 
     def _print_correlator_info(self):
+        """Print configuration info"""
         info = "VisibilityCorrelator Configuration:"
         info += f"\n  Number of Antennas: {self.num_antennas}"
         info += f"\n  Number of Baselines: {self.num_baselines}"
@@ -110,160 +121,203 @@ class VisibilityCorrelator(gr.sync_block):
         self.integration_count = 0
 
     def work(self, input_items, output_items):
-        """Process FFT vectors, correlate, and integrate in one step"""
+        """
+        Process FFT vectors from multiple antennas, compute cross-correlations, and integrate over time.
+        
+        This is the core processing method of the VisibilityCorrelator block that implements a radio 
+        astronomy correlator with built-in integration. The method performs batch correlation of FFT 
+        vectors from all antenna pairs and accumulates the results over time to improve signal-to-noise 
+        ratio through coherent integration.
+        
+        Processing Pipeline:
+        1. **Input Reception**: Receives FFT vectors from all antennas simultaneously
+        2. **GPU Transfer**: Moves input data to GPU device for accelerated processing
+        3. **Cross-Correlation**: Computes visibility matrix V_ij = F_i * conj(F_j) for all antenna pairs
+        4. **Time Integration**: Sums correlations over time samples within the current batch
+        5. **Accumulation**: Adds batch result to integration buffer for long-term averaging
+        6. **Output Generation**: When integration period completes, outputs time-averaged visibilities
+        
+        Mathematical Operations:
+        - Visibility computation uses Einstein summation: torch.einsum('iaf,jaf->ijaf', F, F*)
+        where i,j = antenna indices, a = time samples, f = frequency bins
+        - Only upper triangle baselines are stored (N(N+1)/2 instead of N²) for memory efficiency
+        - Integration averaging: V_avg = (∑V_batch) / N_samples for noise reduction
+        
+        Performance Optimizations:
+        - Vectorized operations using pre-computed baseline indices for GPU acceleration
+        - Batch processing of multiple time samples reduces GPU transfer overhead
+        - Single-precision complex64 arithmetic for optimal GPU performance
+        
+        GNU Radio Integration:
+        - Implements decimation pattern: processes multiple input samples, outputs one integrated sample
+        - Returns 0 during accumulation phase, returns 1 when integration completes
+        - Automatically manages buffer reset for continuous operation
+        
+        Args:
+            input_items (list): List of numpy arrays, one per antenna
+                            Shape: [num_antennas][time_samples, fft_size] 
+                            dtype: complex64 FFT vectors from each antenna
+            output_items (list): List of output arrays, one per baseline  
+                            Shape: [num_baselines][output_samples, fft_size]
+                            dtype: complex64 integrated visibility data
+        
+        Returns:
+            int: Number of output samples produced this call
+                - 0: Still accumulating, no output ready
+                - 1: Integration complete, one averaged sample output per baseline
+        
+        Data Flow Example:
+            Batch 1-(n-1): Process m samples each → accumulate → return 0
+            Batch n:   Process m samples → complete integration → output 1 sample → return 1
+            Batch n+1:   Start new integration cycle → return 0
+            Variables:
+            n = integration_samples / m
+            m = number of time samples per work call - depends on GNU Radio scheduler
+        
+        Integration Logic:
+            - integration_samples: Target number of FFT vectors to average
+            - integration_count: Current number of FFT vectors accumulated
+            - Trigger output when we reached desired number of integration samples:
+              integration_count >= integration_samples
+            - Integration time ≈ integration_samples * fft_size / sampling_rate
+        
+        Memory Management:
+            - integration_buffer: Accumulates correlation sums [num_baselines, fft_size]
+            - Automatic GPU memory transfers minimized for performance
+            - Buffer reset after each integration cycle for continuous operation
+        
+        Monitoring & Statistics:
+            - Tracks sample processing count and timing
+            - Reports statistics every 30 seconds for performance monitoring
+            - Measures total samples processed and integration cycles completed
+        
+        Error Handling:
+            - Graceful fallback to CPU if GPU operations fail
+            - Consistent data types between GPU and CPU processing paths
+            - Automatic device management
+        
+        Radio Astronomy Context:
+            This correlator implements the fundamental operation of interferometry:
+            measuring complex visibilities between antenna pairs to reconstruct
+            sky brightness distributions. The integration process improves sensitivity
+            by averaging out thermal noise while preserving coherent astronomical signals.
+        """
+        # Monitoring - start time
         current_time = time.time()
         if self.start_time is None:
             self.start_time = current_time
-            if VERBOSE:
-                print(f"VisibilityCorrelator: Data flow started at {time.strftime('%H:%M:%S', time.localtime())}")
-        
+
+        # Number of input samples available and output samples to produce (initially zero)
+        # The input items have a shape like: [num_antennas, time_samples, fft_size]
+        # Thus, we have that len(input_items[0]) = time_samples
         num_input_samples = len(input_items[0])
         num_output_samples = 0
-        
-        # Monitor each antenna for data arrival and content
-        for ant_idx in range(self.num_antennas):
-            if len(input_items[ant_idx]) != num_input_samples:
-                print(f"WARNING: Antenna {ant_idx} has {len(input_items[ant_idx])} samples, expected {num_input_samples}")
-            
-            self.samples_per_antenna[ant_idx] += len(input_items[ant_idx])
-            
-            # Record first data arrival time for each antenna
-            if self.first_data_time[ant_idx] is None and len(input_items[ant_idx]) > 0:
-                self.first_data_time[ant_idx] = current_time - self.start_time
-                if VERBOSE:
-                    print(f"Antenna {ant_idx}: First data arrived at +{self.first_data_time[ant_idx]:.3f}s")
-            
-            # Create data fingerprint
-            if len(input_items[ant_idx]) > 0:
-                fingerprint = np.mean(np.abs(input_items[ant_idx][:min(10, len(input_items[ant_idx]))]))
-                self.data_fingerprints[ant_idx].append(fingerprint)
-                if len(self.data_fingerprints[ant_idx]) > 100:
-                    self.data_fingerprints[ant_idx].pop(0)
 
+        # Update total sample count
+        # Sample count refers to the time_samples per antenna (I know it's confusing)
         self.sample_count += num_input_samples
-        
-        if VERBOSE:
-            print(f"VisibilityCorrelator: Processing {num_input_samples} samples, integration: {self.integration_count:,}/{self.integration_samples:,}")
 
-        # Convert to GPU tensor once
+        # Create a matrix of shape [num_antennas, time_samples, fft_size] and move to device
         fft_matrix = torch.stack([
             torch.tensor(input_items[ant_idx], device=self.device) 
             for ant_idx in range(self.num_antennas)
-        ])  # Shape: [num_antennas, num_input_samples, fft_size]
+        ])
+            
+        # Compute visibility matrix for this batch of time samples
+        # The visibility formula is:
+        # V_ij = F_i * conj(F_j)
+        # where F_i is the FFT tensor for antenna i and conj() is the complex conjugate.
+        # Since we have multiple time samples, we compute this for all time samples in one go
+        # Note: Only God knows if 'iaf,jaf->ijaf' is correct - but I am pretty sure it is.
+        visibility_batch = torch.einsum(
+            'iaf,jaf->ijaf',
+            fft_matrix,
+            torch.conj(fft_matrix)
+        ) # Shape: [num_antennas, num_antennas, time_samples, fft_size]
 
-        # Batch process all input samples
-        samples_processed = 0
-        
-        while samples_processed < num_input_samples:
-            # Calculate how many samples we can process without exceeding integration limit
-            samples_remaining = num_input_samples - samples_processed
-            samples_needed = self.integration_samples - self.integration_count
-            batch_size = min(samples_remaining, samples_needed)
-            
-            # Extract batch from input
-            batch_end = samples_processed + batch_size
-            batch_fft = fft_matrix[:, samples_processed:batch_end, :]  # [antennas, batch_size, fft_size]
-            
-            # Compute visibility matrix for this batch
-            visibility_batch = torch.einsum(
-                'iaf,jaf->ijaf',
-                batch_fft,
-                torch.conj(batch_fft)
-            )  # [antennas, antennas, batch_size, fft_size]
-            
-            # Sum over time dimension and accumulate to integration buffer
-            for baseline_idx, (i, j) in enumerate(self.baseline_indices):
-                visibility_sum = torch.sum(visibility_batch[i, j, :, :], dim=0)  # Sum over time
-                if self.use_gpu:
-                    self.integration_buffer[baseline_idx] += visibility_sum
-                else:
-                    self.integration_buffer[baseline_idx] += visibility_sum.cpu().numpy()
-            
-            self.integration_count += batch_size
-            samples_processed += batch_size
-            
-            # Output when integration is complete
-            if self.integration_count >= self.integration_samples:
-                if VERBOSE:
-                    print(f"VisibilityCorrelator: Integration complete! Averaged {self.integration_count:,} samples -> output {num_output_samples}")
-                
-                # Average and output
-                if self.use_gpu:
-                    averaged = (self.integration_buffer / self.integration_count).cpu().numpy()
-                else:
-                    averaged = self.integration_buffer / self.integration_count
-                
-                # Copy to output
-                for baseline_idx in range(self.num_baselines):
-                    output_items[baseline_idx][num_output_samples] = averaged[baseline_idx]
-                
-                num_output_samples += 1
-                self.output_count += 1
-                self.reset_integration_buffers()
-        
-        # Report statistics every 30 seconds
-        if current_time - self.last_report_time > 30.0:
-            self.report_statistics(current_time)
-            self.last_report_time = current_time
-        
+        # Sum over the time dimension (time_samples)
+        integrated_visibility_batch = visibility_batch.sum(dim=2, keepdim=False) # [num_antennas, num_antennas, fft_size]
+
+        # Add this batch's integrated result to the buffer
+        # Remember we only store the upper triangle (baselines) in the integration buffer
+        # this is done to save memory and computation.
+        # We take advantage of pre-computed baseline indices to extract the relevant entries
+        # avoiding explicit loops.
+        # If you are wondering why we don't just do a loop here, it's because this vectorized
+        # approach is MUCH FASTER, especially on GPU.
+        # If you want to convince yourself that this is correct check the constructor where
+        # we pre-compute the baseline indices.
+        if self.use_gpu:
+            self.integration_buffer += integrated_visibility_batch[self.baseline_i_indices, self.baseline_j_indices]
+        else:
+            self.integration_buffer += integrated_visibility_batch[self.baseline_i_indices, self.baseline_j_indices].cpu().numpy()
+
+        # Increment the integration count
+        # This keeps track of how many time samples have been added to the integration buffer
+        # We need this to compute the average later
+        self.integration_count += num_input_samples
+
+        # Check if we have reached the integration sample count
+        if self.integration_count >= self.integration_samples:
+            # At this point, we effectively have an integration buffer with shape [num_baselines, fft_size]
+            # that is the sum over all samples processed so far.
+            # The averaged visibility is simply this buffer divided by the number of samples we added to the buffer.
+            # averaged is now shape: [num_baselines, fft_size]
+            if self.use_gpu:
+                averaged = (self.integration_buffer / self.integration_count).cpu().numpy()
+            else:
+                averaged = self.integration_buffer / self.integration_count
+
+            # Copy to output_items - output_items is a list of arrays, one per baseline
+            # This is where we write the final averaged visibility data to the output
+            # Each output_items[baseline_idx] is an array of shape [max_output_samples, fft_size]
+            # In the documentation of GNU Radio, output_items is structured such that max_output_samples
+            # is preassigned by the scheduler. Here we only produce one output sample per baseline
+            # per work call when integration is complete - thus filling output_items[baseline_idx][0].
+            # I know this is a bit confusing, but that's how GNU Radio works apparently.
+            # Note: Because of this I don't think vectorizing this copy is not worth it.
+            for baseline_idx in range(self.num_baselines):
+                output_items[baseline_idx][num_output_samples] = averaged[baseline_idx]
+                #                                  ↑
+                #                    This is 0, so we're filling slot [0]
+
+            # Increment output sample count
+            # Set num_output_samples to 1 since we produced one integrated output sample
+            # This tells GNU Radio that we have produced one output sample for each baseline.
+            # Reset integration buffers for next round
+            num_output_samples += 1
+            self.output_count += 1
+            self.reset_integration_buffers()
+
+        # Report every 30 seconds
+        if current_time - self.last_report_time > 30:
+            self.print_stats()
+
         return num_output_samples
-
-    def report_statistics(self, current_time):
-        """Report comprehensive statistics about data flow"""
-        elapsed = current_time - self.start_time
-        overall_rate = self.sample_count / elapsed if elapsed > 0 else 0
-        progress = (self.integration_count / self.integration_samples) * 100
-        
-        # Check for sample count differences (indicates dropped samples)
-        min_samples = min(self.samples_per_antenna)
-        max_samples = max(self.samples_per_antenna)
-        
-        # Always show warnings about sample loss
-        if max_samples - min_samples > 0:
-            print(f"WARNING: Sample count mismatch detected! Difference: {max_samples - min_samples}")
-            for i, count in enumerate(self.samples_per_antenna):
-                if count != max_samples:
-                    print(f"  Antenna {i}: {count} samples (missing {max_samples - count})")
-        
-        # Progress report
-        print(f"VisibilityCorrelator: Input rate: {overall_rate:.1f} samples/sec, "
-              f"Integration progress: {progress:.1f}% ({self.integration_count:,}/{self.integration_samples:,}), "
-              f"Completed integrations: {self.output_count}")
-        
-        # Check data similarity and warn about anomalies
-        if all(len(fp) > 10 for fp in self.data_fingerprints):
-            recent_means = [np.mean(fp[-10:]) for fp in self.data_fingerprints]
-            overall_mean = np.mean(recent_means)
-            for i, level in enumerate(recent_means):
-                deviation = abs(level - overall_mean) / overall_mean * 100 if overall_mean > 0 else 0
-                if deviation > 50:  # Warn about major deviations
-                    print(f"WARNING: Antenna {i} data level anomaly: {level:.4f} ({deviation:.1f}% from mean)")
-        
-        # Only show full statistics if verbose
-        if VERBOSE:
+    
+    def print_stats(self):
+        """
+        Print statistics about processing rates and counts
+        """
+        current_time = time.time()
+        elapsed = current_time - self.start_time if self.start_time else 0
+        self.last_report_time = current_time
+        if elapsed > 0:
+            processed_samples = self.sample_count * self.fft_size * self.num_antennas
+            total_output_samples = self.output_count * self.fft_size * self.num_baselines
             print(f"\n=== VisibilityCorrelator Statistics (t={elapsed:.1f}s) ===")
-            print(f"Total samples processed: {self.sample_count:,}")
-            print(f"Samples per antenna: min={min_samples:,}, max={max_samples:,}")
-            if max_samples - min_samples == 0:
-                print("✓ All antennas have equal sample counts")
-            
-            # Check data similarity
-            if all(len(fp) > 10 for fp in self.data_fingerprints):
-                recent_means = [np.mean(fp[-10:]) for fp in self.data_fingerprints]
-                overall_mean = np.mean(recent_means)
-                print(f"Recent data levels (should be similar for noise sources):")
-                for i, level in enumerate(recent_means):
-                    deviation = abs(level - overall_mean) / overall_mean * 100 if overall_mean > 0 else 0
-                    status = "✓" if deviation < 20 else "⚠️"
-                    print(f"  Antenna {i}: {level:.4f} ({deviation:.1f}% from mean) {status}")
-            
+            print(f"Total input samples processed: {processed_samples:.2e}")
+            print(f"Total output samples produced: {total_output_samples:.2e}")
             print("=" * 50)
 
 class VisibilityFileSink(gr.sync_block):
     """
     Simple file sink for visibility data
     """
-    def __init__(self, fft_size=1024, num_baselines=45, data_folder="mock_data", use_gpu=True, flush_interval=10):
+    def __init__(self, fft_size=1024, num_antennas=9, data_folder="mock_data", use_gpu=True, flush_interval=10):
+        # Calculate number of baselines
+        num_baselines = num_antennas * (num_antennas + 1) // 2
+
         # Input signature: visibility data from integrator
         in_sig = [(np.complex64, fft_size)] * num_baselines
         out_sig = []  # No outputs, this is a sink
@@ -276,31 +330,34 @@ class VisibilityFileSink(gr.sync_block):
             out_sig=out_sig,
         )
         
+        # Store parameters
         self.fft_size = fft_size
         self.num_baselines = num_baselines
+        self.num_antennas = num_antennas
         self.data_folder = data_folder
         self.flush_interval = flush_interval
-        self.write_count = 0
         
-        # Open file handles in append mode
+        # Create files with the naming convention baseline_i_j.bin
+        # Make sure that the way we open files is compatible with appending binary data
+        # VERY IMPORTANT: This for loop needs to be the same as in
+        # the correlator to ensure correct baseline ordering
         self.file_handles = []
-        baseline_idx = 0
-        for i in range(int(np.sqrt(2 * num_baselines))):  # Calculate num_antennas from num_baselines
-            for j in range(i, int(np.sqrt(2 * num_baselines))):
-                if baseline_idx < num_baselines:
-                    filename = os.path.join(self.data_folder, f"baseline_{i}_{j}.bin")
-                    self.file_handles.append(open(filename, 'ab'))
-                    baseline_idx += 1
+        for i in range(num_antennas):
+            for j in range(i, num_antennas):
+                filename = os.path.join(data_folder, f"baseline_{i}_{j}.bin")
+                self.file_handles.append(open(filename, 'ab'))
         
         # Add monitoring
         self.samples_written = 0
         self.bytes_written = 0
+        self.write_count = 0
         self.start_time = None
         self.last_report_time = 0
 
         self._print_visibility_info()
 
     def _print_visibility_info(self):
+        """Print configuration info"""
         info = "VisibilityFileSink Configuration:"
         info += f"\n  FFT Size: {self.fft_size}"
         info += f"\n  Number of Baselines: {self.num_baselines}"
@@ -310,50 +367,64 @@ class VisibilityFileSink(gr.sync_block):
 
     def work(self, input_items, output_items):
         """Write visibility data to files"""
+        # Monitoring - start time
         current_time = time.time()
         if self.start_time is None:
             self.start_time = current_time
-            if VERBOSE:
-                print(f"VisibilityFileSink: Data flow started at {time.strftime('%H:%M:%S', time.localtime())}")
-                print("VisibilityFileSink: ✓ Writing to disk has begun!")
 
+        # Number of input samples available - all baselines have the same number of samples
+        # The shape of input_items is like: [num_baselines][num_samples, fft_size]
         num_samples = len(input_items[0])
-        
-        if VERBOSE and num_samples > 0:
-            print(f"VisibilityFileSink: Writing {num_samples} samples to {self.num_baselines} files")
-        
-        for sample_idx in range(num_samples):
+
+        # We assume that num_samples is usually 1 because the correlator outputs
+        # one integrated sample at a time. However, we handle the general case.
+        # If the Correlator outputs multiple samples at once this is very unexpected behavior
+        # as it will mean that the Correlator executed multiple times before the sink.
+        if num_samples == 1:
+            # Fast path for single sample
+            # Loop over baselines and write the sample to the corresponding file
             for baseline_idx in range(self.num_baselines):
-                data = input_items[baseline_idx][sample_idx]
+                data = input_items[baseline_idx][0]  # Get the single sample
                 bytes_to_write = data.tobytes()
                 self.file_handles[baseline_idx].write(bytes_to_write)
                 self.bytes_written += len(bytes_to_write)
+        else:
+            # General path for multiple samples
+            # This should not happen but I have included it for completeness
+            print("⚠️ VisibilityFileSink: Warning - multiple samples received in one work call ⚠️")
+            print("This is unexpected behavior. Proceeding to write all samples. Maybe the Correlator executed twice before the sink?")
+            for sample_idx in range(num_samples):
+                for baseline_idx in range(self.num_baselines):
+                    data = input_items[baseline_idx][sample_idx]
+                    bytes_to_write = data.tobytes()
+                    self.file_handles[baseline_idx].write(bytes_to_write)
+                    self.bytes_written += len(bytes_to_write)
 
-        self.samples_written += num_samples
+        # Update samples written count
+        self.samples_written += num_samples * self.fft_size * self.num_baselines
         self.write_count += num_samples
         
-        if self.write_count >= self.flush_interval:
-            if VERBOSE:
-                print(f"VisibilityFileSink: Flushing {self.write_count} samples to disk")
-            for fh in self.file_handles:
-                fh.flush()
-            self.write_count = 0
-        
-        # Report every 15 seconds
-        if VERBOSE and current_time - self.last_report_time > 15.0:
-            elapsed = current_time - self.start_time
-            sample_rate = self.samples_written / elapsed if elapsed > 0 else 0
-            data_rate_mb = (self.bytes_written / elapsed) / (1024*1024) if elapsed > 0 else 0
-            
-            print(f"\n=== VisibilityFileSink Statistics (t={elapsed:.1f}s) ===")
-            print(f"Samples written: {self.samples_written}")
-            print(f"Sample rate: {sample_rate:.2f} samples/sec")
-            print(f"Data rate: {data_rate_mb:.2f} MB/sec")
-            print(f"Total data written: {self.bytes_written / (1024*1024):.2f} MB")
-            print("=" * 50)
+        # Flush files periodically
+        self._flush()
+
+        # Report every 30 seconds
+        if current_time - self.last_report_time > 30.0:
+            self.print_stats()
             self.last_report_time = current_time
         
         return num_samples
+    
+    def print_stats(self):
+        """Print final statistics"""
+        current_time = time.time()
+        elapsed = current_time - self.start_time if self.start_time else 0
+        if elapsed > 0:
+            print(f"\n=== VisibilityFileSink Last Statistics (t={elapsed:.1f}s) ===")
+            print(f"Total samples written: {self.samples_written:.2e}")
+            print(f"Average sample rate: {self.samples_written / elapsed:.2f} samples/sec")
+            print(f"Average data rate: {(self.bytes_written / elapsed) / (1024*1024):.2f} MB/sec")
+            print(f"Total data written: {self.bytes_written / (1024*1024):.2f} MB")
+            print("=" * 50)
     
     def stop(self):
         """Called when flowgraph stops - close files"""
@@ -361,6 +432,29 @@ class VisibilityFileSink(gr.sync_block):
             if not fh.closed:
                 fh.close()
         return True
+    
+    def _flush(self):
+        """
+        Periodically flushes buffered data to ensure data integrity.
+
+        This method performs two levels of flushing:
+        1. Every `flush_interval` writes, it calls `flush()` on all open file handles
+        to push Python's internal I/O buffers to the operating system.
+        2. Every `flush_interval * 10` writes, it additionally calls `os.fsync()`
+        to force the operating system to write its cached data to the physical disk.
+
+        This strategy provides a balance between performance and data safety:
+        frequent lightweight flushes minimize data loss on crashes, while
+        less frequent `fsync()` calls ensure persistence to disk without
+        excessive I/O overhead.
+        """
+        if self.write_count % self.flush_interval == 0:
+            for fh in self.file_handles:
+                fh.flush() # Clear Python's internal buffer - pushes data to OS
+                
+        if self.write_count % (self.flush_interval * 10) == 0:
+            for fh in self.file_handles:
+                os.fsync(fh.fileno()) # Clear OS's internal buffer - pushes data to disk
 
 
 class Interferometer(gr.top_block, Qt.QWidget):
@@ -437,11 +531,22 @@ class Interferometer(gr.top_block, Qt.QWidget):
         #     for i in range(self.num_antennas)
         # ]
 
-        # Define gaussian noise sources as placeholders for Airspy devices
+        # ##################################################################
+        # Define gaussian noise sources as placeholders for Airspy devices #
+        ####################################################################
+        # ️               This is for testing purposes only ️
         self.airspy_devices = [
             analog.noise_source_c(analog.GR_GAUSSIAN, 0.1, seed=i*42)
             for i in range(self.num_antennas)
         ]
+        # Add throttle blocks to control sample rate
+        self.throttle_blocks = [
+            blocks.throttle(gr.sizeof_gr_complex*1, self.sampling_rate, True)
+            for _ in range(self.num_antennas)
+        ]
+        ###################################################################
+        ###################################################################
+        ###################################################################
 
         # Create FFT blocks
         self.fft_blocks = [
@@ -456,20 +561,21 @@ class Interferometer(gr.top_block, Qt.QWidget):
         ]
 
         # Create Visibility Correlator Block with built-in integration
+        integration_samples = int(integration_time * (sampling_rate / fft_size)) # T_I * (Fs / N)
         self.cross_correlator = VisibilityCorrelator(
             fft_size=fft_size, 
             num_antennas=self.num_antennas,
-            integration_samples=int(integration_time * (sampling_rate / fft_size)),  # Massive integration!
+            integration_samples=integration_samples,
             use_gpu=True
         )
 
         # Create Visibility File Sink Block (connect directly to correlator)
         self.visibility_file_sink = VisibilityFileSink(
             fft_size=fft_size,
-            num_baselines=self.num_antennas * (self.num_antennas + 1) // 2,
+            num_antennas=self.num_antennas,
             data_folder=folder_path,
             use_gpu=True,
-            flush_interval=10
+            flush_interval=100
         )
 
         ##################################################
@@ -523,37 +629,48 @@ class Interferometer(gr.top_block, Qt.QWidget):
         return osmosdr_source
 
     def connect_airspy_to_fft(self, airspy_devices, stream_to_vec_blocks, fft_blocks):
+        ##########################################################
+        # TODO: WHEN USING ACTUAL AIRSPY DEVICES, UNCOMMENT THIS #
+        ##########################################################
+        # for i in range(self.num_antennas):
+        #     self.connect(
+        #         (airspy_devices[i], 0),
+        #         (stream_to_vec_blocks[i], 0)
+        #     )
+        #     self.connect(
+        #         (stream_to_vec_blocks[i], 0),
+        #         (fft_blocks[i], 0)
+        #     )
+        ##########################################################
+        ##########################################################
+
+        ##########################################################
+        # This is for testing purposes only - using throttle     #
+        # block to simulate Airspy device rate control           #
+        # ️         REMOVE WHEN USING ACTUAL AIRSPY DEVICES ️      #
+        ##########################################################
         for i in range(self.num_antennas):
+            # Add throttle between noise source and stream_to_vector
             self.connect(
                 (airspy_devices[i], 0),
+                (self.throttle_blocks[i], 0)  # Rate control
+            )
+            self.connect(
+                (self.throttle_blocks[i], 0),
                 (stream_to_vec_blocks[i], 0)
             )
             self.connect(
                 (stream_to_vec_blocks[i], 0),
                 (fft_blocks[i], 0)
             )
+        ##########################################################
+        ##########################################################
 
     def connect_fft_to_correlator(self, fft_blocks, correlator_block):
         for i in range(self.num_antennas):
             self.connect(
                 (fft_blocks[i], 0),
                 (correlator_block, i)
-            )
-
-    def connect_correlator_to_integrator(self, correlator_block, integrator_block):
-        num_baselines = self.num_antennas * (self.num_antennas + 1) // 2
-        for i in range(num_baselines):
-            self.connect(
-                (correlator_block, i),
-                (integrator_block, i)
-            )
-
-    def connect_integrator_to_file_sink(self, integrator_block, file_sink_block):
-        num_baselines = self.num_antennas * (self.num_antennas + 1) // 2
-        for i in range(num_baselines):
-            self.connect(
-                (integrator_block, i),
-                (file_sink_block, i)
             )
 
     def closeEvent(self, event):
@@ -589,81 +706,26 @@ class Interferometer(gr.top_block, Qt.QWidget):
         self.fft_size = fft_size
 
 
-# Add this test function to check file contents
-def analyze_output_files(folder_path):
-    """Analyze the output files to check for data consistency"""
-    import glob
-    
-    print(f"\n=== Analyzing output files in {folder_path} ===")
-    
-    # Fix the file pattern to match actual filenames
-    files = glob.glob(os.path.join(folder_path, "baseline_*.bin"))
-    if not files:
-        print("No output files found!")
-        return
-    
-    print(f"Found {len(files)} baseline files:")
-    
-    file_sizes = []
-    for file_path in sorted(files):
-        size = os.path.getsize(file_path)
-        file_sizes.append(size)
-        print(f"  {os.path.basename(file_path)}: {size} bytes ({size/(8*1024):.1f} KB)")
-    
-    # Check if all files have similar sizes
-    if file_sizes:
-        min_size, max_size = min(file_sizes), max(file_sizes)
-        if max_size - min_size == 0:
-            print("✓ All files have identical sizes")
-        else:
-            print(f"⚠️ File size variation: {min_size} to {max_size} bytes")
-            
-        # Calculate total data and integration efficiency
-        total_mb = sum(file_sizes) / (1024*1024)
-        print(f"✓ Total visibility data: {total_mb:.2f} MB across {len(files)} baselines")
-
-# Modify the main function to include monitoring
 def main(top_block_cls=Interferometer, options=None):
     qapp = Qt.QApplication(sys.argv)
     folder_name = "mock_data"
     if not os.path.exists(folder_name):
         os.makedirs(folder_name)
 
-    # Start with shorter integration time for faster feedback
     tb = top_block_cls(
         sampling_rate=10e6,
-        integration_time=0.01,  # Very short for quick testing
+        integration_time=1,
         frequency=1.42e9,
         fft_size=1024,
         num_antennas=9,
         folder_path=folder_name
     )
-
-    print("Starting interferometer test...")
-    if VERBOSE:
-        print("Monitor console output for:")
-        print("  - First data arrival times from each antenna")
-        print("  - Sample count consistency")
-        print("  - Data flow rates")
-        print("  - File writing progress")
-    else:
-        print("Running in quiet mode. Only warnings and errors will be displayed.")
-        print(f"Set VERBOSE = True (line 32) for detailed monitoring.")
     
     tb.start()
     tb.show()
 
-    # Schedule file analysis after 30 seconds
-    def analyze_files():
-        time.sleep(30)
-        analyze_output_files(folder_name)
-    
-    analysis_thread = threading.Thread(target=analyze_files, daemon=True)
-    analysis_thread.start()
-
     def sig_handler(sig=None, frame=None):
         print("\nShutting down...")
-        analyze_output_files(folder_name)  # Final analysis
         tb.stop()
         tb.wait()
         Qt.QApplication.quit()
