@@ -429,6 +429,8 @@ class VisibilityFileSink(gr.sync_block):
     def stop(self):
         """Called when flowgraph stops - close files"""
         for fh in self.file_handles:
+            fh.flush() # Clear Python's internal buffer - pushes data to OS
+            os.fsync(fh.fileno()) # Clear OS's internal buffer - pushes data to disk
             if not fh.closed:
                 fh.close()
         return True
