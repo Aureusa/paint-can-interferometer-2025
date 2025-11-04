@@ -1,0 +1,29 @@
+{
+    "airspy=1": {
+        "serial_nr": "0xB58069DC39A14513"
+    },
+    "airspy=2": {
+        "serial_nr": ""
+    },
+    "airspy=3": {
+        "serial_nr": ""
+    },
+    "airspy=4": {
+        "serial_nr": "0xA74068C837274E93"
+    },
+    "airspy=5": {
+        "serial_nr": "0xA74068C830114593"
+    },
+    "airspy=6": {
+        "serial_nr": "0xA74068C830134593"
+    },
+    "airspy=7": {
+        "serial_nr": "0xA74068C83651AE93"
+    },
+    "airspy=8": {
+        "serial_nr": "0xB58069DC394D5313"
+    },
+    "airspy=9": {
+        "serial_nr": "0xB58069DC396E4213"
+    }
+}

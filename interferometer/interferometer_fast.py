@@ -8,33 +8,63 @@
 # Title: Not titled yet
 # GNU Radio version: 3.10.9.2
 
+# Standard library imports
+import os
+import sys
+import json
+import yaml
+import time
+import signal
+import threading
+from datetime import datetime
+from collections import defaultdict
+from argparse import ArgumentParser
+
+# Third-party imports
+import numpy as np
+import torch
 from PyQt5 import Qt
+
+# GNU Radio imports
+from gnuradio import gr
 from gnuradio import qtgui
 from gnuradio import blocks
 from gnuradio import fft
+from gnuradio import analog
 from gnuradio.fft import window
-from gnuradio import gr
 from gnuradio.filter import firdes
-import sys
-import signal
-from PyQt5 import Qt
-from argparse import ArgumentParser
 from gnuradio.eng_arg import eng_float, intx
 from gnuradio import eng_notation
 import osmosdr
-import time
-from gnuradio import analog
 
-import os
-import torch
-import numpy as np
-
-import time
-from datetime import datetime
-from collections import defaultdict
-import threading
-
+# Local imports
 from utils import print_box
+
+
+# File dir
+file_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Open Airspy info JSON
+airspy_info_folder = os.path.join(file_dir, "airspy_info.json")
+with open(airspy_info_folder, 'r') as f:
+    AIRSPY_INFO = json.load(f)
+
+# Open observation config file YAML
+config_folder = os.path.join(file_dir, "observation_conf.yaml")
+with open(config_folder, 'r') as f:
+    OBSERVATION_CONFIG = yaml.safe_load(f)
+
+# Extract device list from config
+DEVICE_LIST = OBSERVATION_CONFIG['device_list']
+
+# Extract airspy parameters from config
+SAMPLING_RATE = int(OBSERVATION_CONFIG['sampling_rate'])
+CENTER_FREQUENCY = int(OBSERVATION_CONFIG['center_frequency'])
+FFT_SIZE = int(OBSERVATION_CONFIG['fft_size'])
+INTEGRATION_TIME = int(OBSERVATION_CONFIG['integration_time'])
+
+# Obs duration
+OBSERVATION_DURATION = int(OBSERVATION_CONFIG['observation_duration'])
 
 
 class VisibilityCorrelator(gr.sync_block):
@@ -93,6 +123,8 @@ class VisibilityCorrelator(gr.sync_block):
         self.output_count = 0
         self.start_time = None
         self.last_report_time = 0
+
+        self.total_samples_processed = 0
 
         self._print_correlator_info()
 
@@ -210,12 +242,13 @@ class VisibilityCorrelator(gr.sync_block):
         # Number of input samples available and output samples to produce (initially zero)
         # The input items have a shape like: [num_antennas, time_samples, fft_size]
         # Thus, we have that len(input_items[0]) = time_samples
-        num_input_samples = len(input_items[0])
+        num_input_samples, curr_fft_size = input_items[0].shape
         num_output_samples = 0
 
         # Update total sample count
         # Sample count refers to the time_samples per antenna (I know it's confusing)
         self.sample_count += num_input_samples
+        self.total_samples_processed += num_input_samples * curr_fft_size * len(input_items)
 
         # Create a matrix of shape [num_antennas, time_samples, fft_size] and move to device
         fft_matrix = torch.stack([
@@ -303,11 +336,11 @@ class VisibilityCorrelator(gr.sync_block):
         elapsed = current_time - self.start_time if self.start_time else 0
         self.last_report_time = current_time
         if elapsed > 0:
-            processed_samples = self.sample_count * self.fft_size * self.num_antennas
+            # processed_samples = self.sample_count * self.fft_size * self.num_antennas
             total_output_samples = self.output_count * self.fft_size * self.num_baselines
             print(f"\n=== VisibilityCorrelator Statistics (t={elapsed:.1f}s) ===")
-            print(f"Total input samples processed: {processed_samples:.2e}")
-            print(f"Total output samples produced: {total_output_samples:.2e}")
+            print(f"Total input samples processed: {self.total_samples_processed}")
+            print(f"Total output samples produced: {total_output_samples}")
             print("=" * 50)
 
 class VisibilityFileSink(gr.sync_block):
@@ -481,7 +514,8 @@ class Interferometer(gr.top_block, Qt.QWidget):
             frequency=1.42e9,
             fft_size=1024,
             num_antennas=9,
-            folder_path="mock_data"
+            folder_path="mock_data",
+            test=False
         ):
         gr.top_block.__init__(self, "Not titled yet", catch_exceptions=True)
         Qt.QWidget.__init__(self)
@@ -528,24 +562,26 @@ class Interferometer(gr.top_block, Qt.QWidget):
         # Create multiple Airspy devices
         # All Airspy devices configured identically assuming airspy=0, airspy=1, ..., airspy=8
         # TODO: This most likely needs to change based on actual device naming conventions
-        # self.airspy_devices = [
-        #     self.def_airspy_device(f"airspy={i}", sampling_rate, frequency)
-        #     for i in range(self.num_antennas)
-        # ]
-
+        if not test:
+            self.airspy_devices = [
+                self.def_airspy_device(device, sampling_rate, frequency)
+                for device in DEVICE_LIST
+            ]
         # ##################################################################
         # Define gaussian noise sources as placeholders for Airspy devices #
         ####################################################################
-        # ️               This is for testing purposes only ️
-        self.airspy_devices = [
-            analog.noise_source_c(analog.GR_GAUSSIAN, 0.1, seed=i*42)
-            for i in range(self.num_antennas)
-        ]
-        # Add throttle blocks to control sample rate
-        self.throttle_blocks = [
-            blocks.throttle(gr.sizeof_gr_complex*1, self.sampling_rate, True)
-            for _ in range(self.num_antennas)
-        ]
+        if test:
+        # ️               This is for testing purposes only
+            self.num_antennas = 9
+            self.airspy_devices = [
+                analog.noise_source_c(analog.GR_GAUSSIAN, 0.1, seed=i*42)
+                for i in range(self.num_antennas)
+            ]
+            # Add throttle blocks to control sample rate
+            self.throttle_blocks = [
+                blocks.throttle(gr.sizeof_gr_complex*1, self.sampling_rate, True)
+                for _ in range(self.num_antennas)
+            ]
         ###################################################################
         ###################################################################
         ###################################################################
@@ -585,7 +621,7 @@ class Interferometer(gr.top_block, Qt.QWidget):
         ##################################################
 
         # Connect each airspy -> stream_to_vector -> fft
-        self.connect_airspy_to_fft(self.airspy_devices, self.stream_to_vector_blocks, self.fft_blocks)
+        self.connect_airspy_to_fft(self.airspy_devices, self.stream_to_vector_blocks, self.fft_blocks, test=test)
 
         # Connect all FFT outputs to correlator inputs
         self.connect_fft_to_correlator(self.fft_blocks, self.cross_correlator)
@@ -614,6 +650,10 @@ class Interferometer(gr.top_block, Qt.QWidget):
         print_box(info)
 
     def def_airspy_device(self, device, sampling_rate, frequency):
+        """Define and configure an Airspy source block"""
+        serial_nr = AIRSPY_INFO[device]['serial_nr']
+        device = f"airspy={serial_nr}"
+
         osmosdr_source = osmosdr.source(
             args="numchan=" + str(1) + " " + device
         )
@@ -630,19 +670,20 @@ class Interferometer(gr.top_block, Qt.QWidget):
         osmosdr_source.set_bandwidth(0, 0)
         return osmosdr_source
 
-    def connect_airspy_to_fft(self, airspy_devices, stream_to_vec_blocks, fft_blocks):
+    def connect_airspy_to_fft(self, airspy_devices, stream_to_vec_blocks, fft_blocks, test=False):
         ##########################################################
         # TODO: WHEN USING ACTUAL AIRSPY DEVICES, UNCOMMENT THIS #
         ##########################################################
-        # for i in range(self.num_antennas):
-        #     self.connect(
-        #         (airspy_devices[i], 0),
-        #         (stream_to_vec_blocks[i], 0)
-        #     )
-        #     self.connect(
-        #         (stream_to_vec_blocks[i], 0),
-        #         (fft_blocks[i], 0)
-        #     )
+        if not test:
+            for i in range(self.num_antennas):
+                self.connect(
+                    (airspy_devices[i], 0),
+                    (stream_to_vec_blocks[i], 0)
+                )
+                self.connect(
+                    (stream_to_vec_blocks[i], 0),
+                    (fft_blocks[i], 0)
+                )
         ##########################################################
         ##########################################################
 
@@ -651,20 +692,21 @@ class Interferometer(gr.top_block, Qt.QWidget):
         # block to simulate Airspy device rate control           #
         # ️         REMOVE WHEN USING ACTUAL AIRSPY DEVICES ️      #
         ##########################################################
-        for i in range(self.num_antennas):
-            # Add throttle between noise source and stream_to_vector
-            self.connect(
-                (airspy_devices[i], 0),
-                (self.throttle_blocks[i], 0)  # Rate control
-            )
-            self.connect(
-                (self.throttle_blocks[i], 0),
-                (stream_to_vec_blocks[i], 0)
-            )
-            self.connect(
-                (stream_to_vec_blocks[i], 0),
-                (fft_blocks[i], 0)
-            )
+        if test:
+            for i in range(self.num_antennas):
+                # Connect: Noise → Throttle → Stream-to-Vec → FFT
+                self.connect(
+                    (airspy_devices[i], 0),
+                    (self.throttle_blocks[i], 0)
+                )
+                self.connect(
+                    (self.throttle_blocks[i], 0),
+                    (stream_to_vec_blocks[i], 0)
+                )
+                self.connect(
+                    (stream_to_vec_blocks[i], 0),
+                    (fft_blocks[i], 0)
+                )
         ##########################################################
         ##########################################################
 
@@ -672,7 +714,7 @@ class Interferometer(gr.top_block, Qt.QWidget):
         for i in range(self.num_antennas):
             self.connect(
                 (fft_blocks[i], 0),
-                (correlator_block, i)
+                (correlator_block, i),
             )
 
     def closeEvent(self, event):
@@ -715,13 +757,14 @@ def main(top_block_cls=Interferometer, options=None):
         os.makedirs(folder_name)
 
     tb = top_block_cls(
-        sampling_rate=10e6,
-        integration_time=1,
-        frequency=1.42e9,
-        fft_size=1024,
-        num_antennas=9,
-        folder_path=folder_name
-    )
+        sampling_rate=SAMPLING_RATE,
+        integration_time=INTEGRATION_TIME,
+        frequency=CENTER_FREQUENCY,
+        fft_size=FFT_SIZE,
+        num_antennas=len(DEVICE_LIST),
+        folder_path=folder_name,
+        test=True
+    ) 
     
     tb.start()
     tb.show()
@@ -732,12 +775,27 @@ def main(top_block_cls=Interferometer, options=None):
         tb.wait()
         Qt.QApplication.quit()
 
+    def observation_timeout():
+        """Called when observation duration is reached"""
+        print(f"\n🎯 Observation complete! Ran for {OBSERVATION_DURATION} seconds")
+        print("Stopping interferometer...")
+        sig_handler()
+
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
 
     timer = Qt.QTimer()
     timer.start(500)
     timer.timeout.connect(lambda: None)
+
+    # Timer for automatic observation stop
+    observation_timer = Qt.QTimer()
+    observation_timer.setSingleShot(True)  # Only trigger once
+    observation_timer.timeout.connect(observation_timeout)
+    observation_timer.start(OBSERVATION_DURATION * 1000)  # Convert seconds to milliseconds
+
+    print(f"🚀 Starting {OBSERVATION_DURATION}-second observation...")
+    print(f"📊 Will automatically stop after {OBSERVATION_DURATION} seconds")
 
     qapp.exec_()
 
