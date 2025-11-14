@@ -11,11 +11,17 @@ The way the data is organized within this folder is as follows:
     Schematically:
     DATA_FOLDER/
         session_20231015_153000/
-            antenna_1_date_20231015_time_153000
-            antenna_2_date_20231015_time_153000
+            antenna_1.dat
+            antenna_2.dat
+            .
+            .
+            .
         session_20231016_101500/
-            antenna_1_date_20231016_time_101500
-            antenna_2_date_20231016_time_101500
+            antenna_1.dat
+            antenna_2.dat
+            .
+            .
+            .
 
 The DataReader class provides methods to:
     - Load data from a specified session folder.
@@ -30,7 +36,6 @@ from logging import log
 from dotenv import load_dotenv
 import warnings
 
-from .obs_md import ObservationMetadata
 from .utils import reshape_fft_data
 
 from utils import print_box
@@ -54,12 +59,13 @@ class DataReader:
         load_dotenv()
         self.num_antennas = int(os.getenv("NUMBER_OF_ANTENNAS"))
         self.base_data_folder = Path(os.getenv("DATA_FOLDER"))
+        self.fft_size = int(os.getenv("FFT_SIZE", "1024"))  # Default to 1024 if not set
         if not self.base_data_folder.exists():
             raise FileNotFoundError(f"Data folder {self.base_data_folder} does not exist.")
 
         self.session_folders = self._get_session_folders()
 
-    def get_data(self, session_folder: str, fft_size: Union[None, int] = None) -> dict[int, np.ndarray]:
+    def get_data(self, session_folder: str, antenna_nr: int = None) -> dict[int, np.ndarray]:
         """
         Read data files from a specified session folder.
 
@@ -77,72 +83,50 @@ class DataReader:
             )
 
         data = {}
+        if antenna_nr is not None:
+            data_arr = self._get_antenna_data(antenna_nr, session_folder, session_path)
+            data[antenna_nr] = data_arr
+            return data
+
         for antenna_num in range(1, self.num_antennas + 1):
-            file_pattern = f"antenna_{antenna_num}_*"
-            files = list(session_path.glob(file_pattern))
-            if not files:
-                warnings.warn(
-                    f"No data file found for antenna {antenna_num} in session {session_folder}.",
-                    UserWarning
-                )
-                continue
-            if len(files) > 1:
-                warnings.warn(
-                    f"Multiple data files found for antenna {antenna_num} in session {session_folder}."
-                    f" Using the first one.",
-                    UserWarning
-                )
-
-            # Assume data is stored in raw binary format as float32
-            warnings.warn(
-                f"Assuming data file {files[0]} is in raw binary format with float32 data type.",
-                UserWarning
-            )
-            data_array = np.fromfile(files[0], dtype=np.float32)
-            data[antenna_num] = data_array
-
-            # Reshape data if fft_size is provided or can be obtained from metadata
-            if fft_size is not None:
-                data[antenna_num] = reshape_fft_data(data_array, fft_size=fft_size)
-                print_box(f"Reshaped data for antenna {antenna_num} using the provided fft_size argument into segments of size {fft_size}.")
-            else:
-                try:
-                    metadata = self.get_metadata(session_folder)
-                    fft_size = metadata.fft_size
-
-                    data[antenna_num] = reshape_fft_data(data_array, fft_size=fft_size)
-                    print_box(f"Reshaped data for antenna {antenna_num} using fft_size from metadata into segments of size {fft_size}.")
-                except:
-                    info = f"Failed to reshape data for antenna {antenna_num} using fft_size from metadata."
-                    info += "\nSince no fft_size argument was provided, returning raw data array."
-                    print_box(info)
+            data_arr = self._get_antenna_data(antenna_num, session_folder, session_path)
+            data[antenna_num] = data_arr
 
         return data
     
-    def get_metadata(self, session_folder: str) -> ObservationMetadata:
-        """
-        Read metadata from a specified session folder.
-
-        :param session_folder: Name of the session folder to read metadata from.
-        Must be one of the folders listed by the `list_sessions` method.
-        :type session_folder: str
-        :return: Dictionary containing metadata information.
-        :rtype: dict
-        """
-        session_path = self.base_data_folder / session_folder
-        metadata_file = session_path / "observation_metadata.json"
-        if not metadata_file.exists():
-            raise FileNotFoundError(
-                f"Metadata file {metadata_file} does not exist in session {session_folder}."
+    def _get_antenna_data(self, antenna_num: int, session_folder: str, session_path: Path) -> Union[np.ndarray, None]:
+        file_pattern = f"antenna_{antenna_num}.dat"
+        files = list(session_path.glob(file_pattern))
+        if not files:
+            warnings.warn(
+                f"No data file found for antenna {antenna_num} in session {session_folder}.",
+                UserWarning
             )
-        
-        import json
-        with open(metadata_file, 'r') as f:
-            metadata = json.load(f)
+            return None
+        if len(files) > 1:
+            warnings.warn(
+                f"Multiple data files found for antenna {antenna_num} in session {session_folder}."
+                f" Using the first one.",
+                UserWarning
+            )
 
-        metadata = ObservationMetadata.from_dict(metadata)
-        
-        return metadata
+        # Assume data is stored in raw binary format as float32
+        warnings.warn(
+            f"Assuming data file {files[0]} is in raw binary format with complex64 data type.",
+            UserWarning
+        )
+        data_array = np.fromfile(files[0], dtype=np.complex64)
+
+        # Reshape data if fft_size is provided or can be obtained from metadata
+        try:
+            reshaped_data_array = reshape_fft_data(data_array, fft_size=self.fft_size)
+            print_box(f"Reshaped data for antenna {antenna_num} using fft_size from metadata into segments of size {self.fft_size}.")
+        except:
+            info = f"Failed to reshape data for antenna {antenna_num} using fft_size from metadata."
+            info += "\nSince no fft_size argument was provided, returning raw data array."
+            print_box(info)
+            reshaped_data_array = data_array
+        return reshaped_data_array
 
     def list_sessions(self) -> list[str]:
         """
