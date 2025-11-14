@@ -2,33 +2,38 @@
 # Observation configuration for AirSpy devices #
 ################################################
 
-# Sampling rate for the observation
-sampling_rate: 2500000 #10e6 in Hz
+###########################################
+#    MAKE SURE TO DEFINE THE FOLLOWING    #
+###########################################
 
-# Center frequency for the observation
-center_frequency: 1420000000 #1.42e9 in Hz
+# Start observation - CHANGE THIS TO THE RIGHT TIME!!!
+start_time: 2025-11-14T16:35:00+01:00 # YYYY-MM-DDTHH:MM:SS+TZ
 
-# FFT size for the auto-correlation
-fft_size: 1024  # Number of points in FFT
-
-# Integration time for each observation
-integration_time: 1  # in seconds
-
-# Observation duration
-observation_duration: 120  # in seconds
+# Observation duration in seconds - Currently set to 10 minutes
+observation_duration: 600  # in seconds
 
 # List of AirSpy devices
 device_list: [
-  airspy=1,
-  # airspy=2, # NOT HERE
-  airspy=3,
-  airspy=4,
-  airspy=5,
-  airspy=6,
-  airspy=7,
+  # airspy=1,
+  # airspy=2,
+  # airspy=3,
+  # airspy=4,
+  # airspy=5,
+  # airspy=6,
+  # airspy=7,
   airspy=8,
-  airspy=9,
+  # airspy=9,
 ]
 
 # Data storage path
-data_storage_path: D:\\Leiden University\\1st_year\\semester_1\\Radio Astronomy\\paint-can-interferometer-2025\\mock_data
+data_storage_path: mock_data
+
+###########################################
+#   THIS IS GENERALLY NOT TO BE CHANGED   #
+###########################################
+
+# Sampling rate for the observation
+sampling_rate: 10000000 #10e6 in Hz
+
+# Center frequency for the observation
+center_frequency: 1420000000 #1.42e9 in Hz

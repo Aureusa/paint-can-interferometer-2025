@@ -120,10 +120,9 @@ class DataReader:
         # Reshape data if fft_size is provided or can be obtained from metadata
         try:
             reshaped_data_array = reshape_fft_data(data_array, fft_size=self.fft_size)
-            print_box(f"Reshaped data for antenna {antenna_num} using fft_size from metadata into segments of size {self.fft_size}.")
+            print_box(f"Reshaped data for antenna {antenna_num} using fft_size of {self.fft_size}.")
         except:
-            info = f"Failed to reshape data for antenna {antenna_num} using fft_size from metadata."
-            info += "\nSince no fft_size argument was provided, returning raw data array."
+            info = f"Failed to reshape data for antenna {antenna_num}. Using raw data shape: {data_array.shape}."
             print_box(info)
             reshaped_data_array = data_array
         return reshaped_data_array

@@ -14,6 +14,7 @@ import sys
 import json
 import yaml
 import signal
+import time
 
 # Third-party imports
 from PyQt5 import Qt
@@ -49,8 +50,6 @@ DEVICE_LIST = OBSERVATION_CONFIG['device_list']
 # Extract airspy parameters from config
 SAMPLING_RATE = int(OBSERVATION_CONFIG['sampling_rate'])
 CENTER_FREQUENCY = int(OBSERVATION_CONFIG['center_frequency'])
-FFT_SIZE = int(OBSERVATION_CONFIG['fft_size'])
-INTEGRATION_TIME = int(OBSERVATION_CONFIG['integration_time'])
 
 # Obs duration
 OBSERVATION_DURATION = int(OBSERVATION_CONFIG['observation_duration'])
@@ -77,12 +76,9 @@ class Interferometer(gr.top_block, Qt.QWidget):
     def __init__(
             self,
             sampling_rate=10e6,
-            integration_time=1,
             frequency=1.42e9,
-            fft_size=1024,
             num_antennas=9,
             folder_path="mock_data",
-            test=False
         ):
         gr.top_block.__init__(self, "Not titled yet", catch_exceptions=True)
         Qt.QWidget.__init__(self)
@@ -116,10 +112,8 @@ class Interferometer(gr.top_block, Qt.QWidget):
         ##################################################
         # Variables
         ##################################################
-        self.sampling_rate = sampling_rate
-        self.integration_time = integration_time
         self.frequency = frequency
-        self.fft_size = fft_size
+        self.sampling_rate = sampling_rate
         self.num_antennas = num_antennas
 
         ##################################################
@@ -127,47 +121,15 @@ class Interferometer(gr.top_block, Qt.QWidget):
         ##################################################
 
         # Create multiple Airspy devices
-        # All Airspy devices configured identically assuming airspy=0, airspy=1, ..., airspy=8
-        # TODO: This most likely needs to change based on actual device naming conventions
-        if not test:
-            self.airspy_devices = [
-                self.def_airspy_device(device, sampling_rate, frequency)
-                for device in DEVICE_LIST
-            ]
-        # ##################################################################
-        # Define gaussian noise sources as placeholders for Airspy devices #
-        ####################################################################
-        if test:
-        # ️               This is for testing purposes only
-            self.num_antennas = 9
-            self.airspy_devices = [
-                analog.noise_source_c(analog.GR_GAUSSIAN, 0.1, seed=i*42)
-                for i in range(self.num_antennas)
-            ]
-            # Add throttle blocks to control sample rate
-            self.throttle_blocks = [
-                blocks.throttle(gr.sizeof_gr_complex*1, self.sampling_rate, True)
-                for _ in range(self.num_antennas)
-            ]
-        ###################################################################
-        ###################################################################
-        ###################################################################
-
-        # Create FFT blocks
-        self.fft_blocks = [
-            fft.fft_vcc(fft_size, True, window.blackmanharris(fft_size), True, 1)
-            for _ in range(self.num_antennas)
+        self.airspy_devices = [
+            self.def_airspy_device(device, sampling_rate, frequency)
+            for device in DEVICE_LIST
         ]
-
-        # Create stream to vector blocks
-        self.stream_to_vector_blocks = [
-            blocks.stream_to_vector(gr.sizeof_gr_complex*1, fft_size)
-            for _ in range(self.num_antennas)
-        ]
-
+        
+        # Create file sinks for each Airspy
         self.file_sinks = [
             blocks.file_sink(
-                gr.sizeof_gr_complex*self.fft_size,
+                gr.sizeof_gr_complex,
                 os.path.join(folder_path, f'antenna_{device.split("=")[1]}.dat'),
                 False
             )
@@ -178,18 +140,10 @@ class Interferometer(gr.top_block, Qt.QWidget):
         # Connections
         ##################################################
 
-        # Connect each airspy -> stream_to_vector -> fft -> filesink
+        # Connect each airspy -> filesink
         for i in range(self.num_antennas):
             self.connect(
                 (self.airspy_devices[i], 0),
-                (self.stream_to_vector_blocks[i], 0)
-            )
-            self.connect(
-                (self.stream_to_vector_blocks[i], 0),
-                (self.fft_blocks[i], 0)
-            )
-            self.connect(
-                (self.fft_blocks[i], 0),
                 (self.file_sinks[i], 0)
             )
 
@@ -200,7 +154,6 @@ class Interferometer(gr.top_block, Qt.QWidget):
         info += f"\n  Number of Antennas: {self.num_antennas}"
         info += f"\n  Sampling Rate: {self.sampling_rate/1e6} MHz"
         info += f"\n  Frequency: {self.frequency/1e6} MHz"
-        info += f"\n  FFT Size: {self.fft_size}"
         print_box(info)
 
     def def_airspy_device(self, device, sampling_rate, frequency):
@@ -224,50 +177,6 @@ class Interferometer(gr.top_block, Qt.QWidget):
         osmosdr_source.set_bandwidth(0, 0)
         return osmosdr_source
 
-    def connect_airspy_to_fft(self, airspy_devices, stream_to_vec_blocks, fft_blocks, test=False):
-        ##########################################################
-        # TODO: WHEN USING ACTUAL AIRSPY DEVICES, UNCOMMENT THIS #
-        ##########################################################
-        if not test:
-            for i in range(self.num_antennas):
-                self.connect(
-                    (airspy_devices[i], 0),
-                    (stream_to_vec_blocks[i], 0)
-                )
-                self.connect(
-                    (stream_to_vec_blocks[i], 0),
-                    (fft_blocks[i], 0)
-                )
-                self.connect(
-                    (fft_blocks[i], 0),
-                    (self.file_sinks[i], 0)
-                )
-        ##########################################################
-        ##########################################################
-
-        ##########################################################
-        # This is for testing purposes only - using throttle     #
-        # block to simulate Airspy device rate control           #
-        # ️         REMOVE WHEN USING ACTUAL AIRSPY DEVICES ️      #
-        ##########################################################
-        if test:
-            for i in range(self.num_antennas):
-                # Connect: Noise → Throttle → Stream-to-Vec → FFT
-                self.connect(
-                    (airspy_devices[i], 0),
-                    (self.throttle_blocks[i], 0)
-                )
-                self.connect(
-                    (self.throttle_blocks[i], 0),
-                    (stream_to_vec_blocks[i], 0)
-                )
-                self.connect(
-                    (stream_to_vec_blocks[i], 0),
-                    (fft_blocks[i], 0)
-                )
-        ##########################################################
-        ##########################################################
-
     def closeEvent(self, event):
         self.settings = Qt.QSettings("GNU Radio", "Interferometer")
         self.settings.setValue("geometry", self.saveGeometry())
@@ -282,26 +191,94 @@ class Interferometer(gr.top_block, Qt.QWidget):
     def set_sampling_rate(self, sampling_rate):
         self.sampling_rate = sampling_rate
 
-    def get_integration_time(self):
-        return self.integration_time
-
-    def set_integration_time(self, integration_time):
-        self.integration_time = integration_time
-
     def get_frequency(self):
         return self.frequency
 
     def set_frequency(self, frequency):
         self.frequency = frequency
 
-    def get_fft_size(self):
-        return self.fft_size
+def _wait_for_start_time():
+    """Wait until the configured start time before proceeding"""
+    # Get the configured start time
+    start_time_config = OBSERVATION_CONFIG.get('start_time', None)
+    
+    # Handle both string and datetime objects from YAML
+    if start_time_config is None:
+        print("No start_time configured - starting immediately")
+        start_time_str = "Not configured"
+    elif isinstance(start_time_config, str):
+        # It's already a string (like "2025-11-14T15:25:00Z")
+        start_time_str = start_time_config
+    else:
+        # It's a datetime object from YAML parsing
+        # Check if it has timezone info to avoid adding Z incorrectly
+        if hasattr(start_time_config, 'tzinfo') and start_time_config.tzinfo is not None:
+            # Convert to UTC and format properly
+            import datetime
+            start_time_utc = start_time_config.astimezone(datetime.timezone.utc)
+            start_time_str = start_time_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            # Assume it's already UTC
+            start_time_str = start_time_config.strftime("%Y-%m-%dT%H:%M:%SZ")
+    
+    # Get current time
+    curr_time_str = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    def set_fft_size(self, fft_size):
-        self.fft_size = fft_size
+    print(f"Observation start time (UTC): {start_time_str}")
+    print(f"Current time (UTC): {curr_time_str}")
+
+    # Calculate time difference if we have a valid start time
+    if start_time_config is not None:
+        try:
+            import datetime
+            if isinstance(start_time_config, str):
+                # Handle Z suffix properly
+                if start_time_config.endswith('Z'):
+                    start_time = datetime.datetime.fromisoformat(start_time_config[:-1] + '+00:00')
+                else:
+                    start_time = datetime.datetime.fromisoformat(start_time_config)
+            else:
+                # Handle datetime object
+                if hasattr(start_time_config, 'tzinfo') and start_time_config.tzinfo is not None:
+                    start_time = start_time_config.astimezone(datetime.timezone.utc)
+                else:
+                    start_time = start_time_config.replace(tzinfo=datetime.timezone.utc)
+            
+            curr_time = datetime.datetime.now(datetime.timezone.utc)
+            time_difference = (start_time - curr_time).total_seconds()
+            print(f"Time difference: {time_difference:.1f} seconds")
+            
+            if time_difference > 0:
+                print(f"Would wait {time_difference:.1f} seconds...")
+            else:
+                print("Start time has already passed")
+        except Exception as e:
+            print(f"Error calculating time difference: {e}")
+
+    if time_difference < 0:
+        raise SystemExit("The time difference is not positive - please double check the start_time configuration!")
+
+    print(f"Waiting for scheduled start time...")
+    time.sleep(time_difference)
+
+    # Convert start_time_str to Amsterdam time
+    start_time_amst_time = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+    print(f"Starting interferometer at {start_time_amst_time}...")
+
+    # Create folder like session_20231015_153000
+    create_session_folder = f"session_{time.strftime('%Y%m%d_%H%M%S', time.localtime())}"
+
+    data_folder = os.path.join(DATA_STORAGE_PATH, create_session_folder)
+    if not os.path.exists(data_folder):
+        os.makedirs(data_folder)
+
+    return data_folder
 
 
-def main(top_block_cls=Interferometer, options=None, test: bool = False):
+def main(top_block_cls=Interferometer, options=None):
+    # Wait for starting time
+    data_folder = _wait_for_start_time()
+
     qapp = Qt.QApplication(sys.argv)
 
     if not os.path.exists(DATA_STORAGE_PATH):
@@ -309,12 +286,9 @@ def main(top_block_cls=Interferometer, options=None, test: bool = False):
 
     tb = top_block_cls(
         sampling_rate=SAMPLING_RATE,
-        integration_time=INTEGRATION_TIME,
         frequency=CENTER_FREQUENCY,
-        fft_size=FFT_SIZE,
         num_antennas=len(DEVICE_LIST),
-        folder_path=DATA_STORAGE_PATH,
-        test=test
+        folder_path=data_folder,
     ) 
     
     tb.start()
@@ -335,7 +309,6 @@ def main(top_block_cls=Interferometer, options=None, test: bool = False):
         print("Stopping interferometer...")
         sig_handler()
         
-
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
 
@@ -353,6 +326,7 @@ def main(top_block_cls=Interferometer, options=None, test: bool = False):
     print(f"📊 Will automatically stop after {OBSERVATION_DURATION} seconds")
 
     qapp.exec_()
+
 
 if __name__ == '__main__':
     main()
