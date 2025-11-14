@@ -7,12 +7,13 @@
 ###########################################
 
 # Start observation - CHANGE THIS TO THE RIGHT TIME!!!
-start_time: 2025-11-14T16:35:00+01:00 # YYYY-MM-DDTHH:MM:SS+TZ
+start_time: 2025-11-14T16:44:15+01:00 # YYYY-MM-DDTHH:MM:SS+TZ
 
 # Observation duration in seconds - Currently set to 10 minutes
 observation_duration: 600  # in seconds
 
 # List of AirSpy devices
+# Make sure to uncoment the Airspys connected to your computer
 device_list: [
   # airspy=1,
   # airspy=2,
@@ -21,7 +22,7 @@ device_list: [
   # airspy=5,
   # airspy=6,
   # airspy=7,
-  airspy=8,
+  # airspy=8,
   # airspy=9,
 ]
 

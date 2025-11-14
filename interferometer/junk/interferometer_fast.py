@@ -66,6 +66,9 @@ INTEGRATION_TIME = int(OBSERVATION_CONFIG['integration_time'])
 # Obs duration
 OBSERVATION_DURATION = int(OBSERVATION_CONFIG['observation_duration'])
 
+# Extract folder
+DATA_FOLDER = OBSERVATION_CONFIG['data_storage_path']
+
 
 class VisibilityCorrelator(gr.sync_block):
     """
@@ -139,17 +142,10 @@ class VisibilityCorrelator(gr.sync_block):
 
     def reset_integration_buffers(self):
         """Reset integration buffers"""
-        if self.use_gpu:
-            self.integration_buffer = torch.zeros(
-                (self.num_baselines, self.fft_size), 
-                dtype=torch.complex64, 
-                device=self.device
-            )
-        else:
-            self.integration_buffer = np.zeros(
-                (self.num_baselines, self.fft_size), 
-                dtype=np.complex64
-            )
+        self.integration_buffer = np.zeros(
+            (self.num_antennas, 1, self.fft_size), 
+            dtype=np.complex64
+        )
         self.integration_count = 0
 
     def work(self, input_items, output_items):
@@ -242,52 +238,12 @@ class VisibilityCorrelator(gr.sync_block):
         # Number of input samples available and output samples to produce (initially zero)
         # The input items have a shape like: [num_antennas, time_samples, fft_size]
         # Thus, we have that len(input_items[0]) = time_samples
-        num_input_samples, curr_fft_size = input_items[0].shape
-        num_output_samples = 0
-
-        # Update total sample count
-        # Sample count refers to the time_samples per antenna (I know it's confusing)
-        self.sample_count += num_input_samples
-        self.total_samples_processed += num_input_samples * curr_fft_size * len(input_items)
-
-        # Create a matrix of shape [num_antennas, time_samples, fft_size] and move to device
-        fft_matrix = torch.stack([
-            torch.tensor(input_items[ant_idx], device=self.device) 
-            for ant_idx in range(self.num_antennas)
-        ])
-            
-        # Compute visibility matrix for this batch of time samples
-        # The visibility formula is:
-        # V_ij = F_i * conj(F_j)
-        # where F_i is the FFT tensor for antenna i and conj() is the complex conjugate.
-        # Since we have multiple time samples, we compute this for all time samples in one go
-        # Note: Only God knows if 'iaf,jaf->ijaf' is correct - but I am pretty sure it is.
-        visibility_batch = torch.einsum(
-            'iaf,jaf->ijaf',
-            fft_matrix,
-            torch.conj(fft_matrix)
-        ) # Shape: [num_antennas, num_antennas, time_samples, fft_size]
-
-        # Sum over the time dimension (time_samples)
-        integrated_visibility_batch = visibility_batch.sum(dim=2, keepdim=False) # [num_antennas, num_antennas, fft_size]
-
-        # Add this batch's integrated result to the buffer
-        # Remember we only store the upper triangle (baselines) in the integration buffer
-        # this is done to save memory and computation.
-        # We take advantage of pre-computed baseline indices to extract the relevant entries
-        # avoiding explicit loops.
-        # If you are wondering why we don't just do a loop here, it's because this vectorized
-        # approach is MUCH FASTER, especially on GPU.
-        # If you want to convince yourself that this is correct check the constructor where
-        # we pre-compute the baseline indices.
-        if self.use_gpu:
-            self.integration_buffer += integrated_visibility_batch[self.baseline_i_indices, self.baseline_j_indices]
-        else:
-            self.integration_buffer += integrated_visibility_batch[self.baseline_i_indices, self.baseline_j_indices].cpu().numpy()
-
-        # Increment the integration count
-        # This keeps track of how many time samples have been added to the integration buffer
-        # We need this to compute the average later
+        inp_arr = np.array(input_items) # Shape: [num_antennas, time_samples, fft_size]
+        arr_shape = inp_arr.shape
+        num_input_samples = arr_shape[1] * arr_shape[2]
+        
+        # Add to self.integration_buffer
+        np.append(inp_arr, self.integration_buffer, axis=1)
         self.integration_count += num_input_samples
 
         # Check if we have reached the integration sample count
@@ -296,10 +252,28 @@ class VisibilityCorrelator(gr.sync_block):
             # that is the sum over all samples processed so far.
             # The averaged visibility is simply this buffer divided by the number of samples we added to the buffer.
             # averaged is now shape: [num_baselines, fft_size]
+            integration_buffer = self.integration_buffer[:,1:,:] # Remove the initial zero column
+
             if self.use_gpu:
-                averaged = (self.integration_buffer / self.integration_count).cpu().numpy()
+                fft_matrix = torch.from_numpy(self.integration_buffer).to(
+                    self.device, non_blocking=True
+                ) # Shape: [num_antennas, num_samples, fft_size]
+
+                visibilities = torch.einsum(
+                    'iaf,jaf->ijaf',
+                    fft_matrix,
+                    torch.conj(fft_matrix)
+                ) # Shape: [num_antennas, num_antennas, time_samples, fft_size]
+
+                averaged = visibilities.mean(dim=2)  # Average over time samples
             else:
-                averaged = self.integration_buffer / self.integration_count
+                visibilities = np.einsum(
+                    'iaf,jaf->ijaf',
+                    integration_buffer,
+                    np.conj(integration_buffer)
+                ) # Shape: [num_antennas, num_antennas, time_samples, fft_size]
+
+                averaged = visibilities.mean(axis=2)  # Average over time samples
 
             # Copy to output_items - output_items is a list of arrays, one per baseline
             # This is where we write the final averaged visibility data to the output
@@ -750,7 +724,7 @@ class Interferometer(gr.top_block, Qt.QWidget):
         self.fft_size = fft_size
 
 
-def main(top_block_cls=Interferometer, options=None):
+def main(top_block_cls=Interferometer, options=None, test=False):
     qapp = Qt.QApplication(sys.argv)
     folder_name = "mock_data"
     if not os.path.exists(folder_name):
@@ -763,7 +737,7 @@ def main(top_block_cls=Interferometer, options=None):
         fft_size=FFT_SIZE,
         num_antennas=len(DEVICE_LIST),
         folder_path=folder_name,
-        test=True
+        test=test
     ) 
     
     tb.start()
