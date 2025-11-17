@@ -1,4 +1,4 @@
-from interferometer.interferometer import main
+from interferometer import main
 
 if __name__ == "__main__":
     main()
