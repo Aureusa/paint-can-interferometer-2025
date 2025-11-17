@@ -1,0 +1,1 @@
+from .correlator_gpu import GPUCorrelator
