@@ -1,0 +1,42 @@
+# PyUVSim Observation Parameter File
+# For SCALAR small array interferometer simulation
+
+filing:
+  outdir: './pyuvsim_output'
+  outfile_name: 'scalar_sim'
+  output_format: 'ms'  # Options: 'uvh5', 'uvfits', 'miriad', 'ms'
+  clobber: True  # Overwrite existing files
+
+freq:
+  # L-band frequency range (1.4 GHz region - typical for HI observations)
+  start_freq: 1420000000.0  # 1.42 GHz in Hz
+  Nfreqs: 1  # Single frequency channel (matching other simulations)
+  channel_width: 1000000.0  # 1 MHz channel width
+  bandwidth: 1000000.0  # 1 MHz total bandwidth (required for Nfreqs=1)
+  # Using single frequency to match manual PSF calculations
+
+time:
+  # Observation setup
+  start_time: 2460969.5  # Julian date (approximately 2023)
+  duration_hours: 0.2
+  integration_time: 10.0  # 5 seconds per integration
+
+telescope:
+  array_layout: 'pyuvsim_array_layout.csv'
+  telescope_config_name: 'pyuvsim_telescope_config.yaml'
+
+sources:
+  # Use mock catalog for testing - single point source at zenith
+  catalog: 'mock'
+  mock_arrangement: 'zenith'
+  # Alternatively, can specify a real catalog file:
+  # catalog: 'pyuvsim_source_catalog.txt'
+  # filetype: 'text'
+
+# Optional: select specific baselines/antennas
+# select:
+#   ant_str: 'cross'  # Only cross-correlations (no autocorrelations)
+  
+ordering:
+  conjugation_convention: 'ant1<ant2'
+  blt_order: ['time', 'baseline']

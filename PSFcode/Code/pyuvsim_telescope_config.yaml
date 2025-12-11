@@ -1,0 +1,18 @@
+# PyUVSim Telescope Configuration File
+# SCALAR small array - Leiden University
+
+# Telescope name
+telescope_name: SCALAR
+
+# Telescope location (Leiden, Netherlands)
+# Format: (latitude_deg, longitude_deg, altitude_m)
+telescope_location: (4.492644, 52.160114, 0.0)
+
+# Beam models for each antenna
+# BeamID 0: Uniform beam (simple model for cantenna-style antennas)
+beam_paths:
+  0: !AnalyticBeam
+    class: 'UniformBeam'
+  1: !AnalyticBeam
+    class: 'GaussianBeam'
+    diameter: 0.183  # 178mm diameter dishes
